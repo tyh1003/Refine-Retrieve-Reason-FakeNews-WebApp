@@ -1,0 +1,42 @@
+# 基礎配置
+model_name: "google/gemma-3-1b-it"
+output_dir: "./model/gemma3_1b_rag_finetuned_2"
+
+# 訓練超參數
+epochs: 5
+batch_size: 2                   #  從 4 降到 2，大幅減輕顯存瞬間壓力
+gradient_accumulation_steps: 4    #  從 2 提高到 4，(2 x 4 = 8) 確保等效總量不變
+lr: 2e-4
+weight_decay: 0.01
+warmup_steps: 20
+max_grad_norm: 1.0
+seed: 42
+
+# 文本長度與損失加權優化 (依據 VRAM 擴充至 1024)
+max_length: 1024
+label_loss_weight: 5.0
+reason_loss_weight: 1.0
+
+# 效能瓶頸優化
+dataloader_num_workers: 2
+dataloader_pin_memory: true
+bf16: true                        #  針對 L4 優化：開啟 bfloat16 速度飛快且省顯存
+attn_implementation: "sdpa"       # 硬體自適應加速格式
+
+# 系統提示詞（完美匹配更新後的 JSON 輸出格式：新增 conf，移除 knowledge）
+system_prompt: |
+  你是一個嚴格的 RAG 假訊息判斷系統，需要完成任務並嚴格的遵守任務限制。
+
+  你需要輸出一個完整的 JSON 物件，包含以下三個欄位：
+  1. pred_label：判斷短影音的真偽 (0 為真，1 為假)
+  2. conf：對此判斷的信心度分數 (0.0 到 1.0 之間的浮點數)
+  3. reason：判斷的原因 (必須使用繁體中文，完整說明依據)
+
+  任務限制：
+  - 不可自行引用額外的知識，不可產生幻覺。
+  - pred_label 只能輸出 0 或 1。
+  - "0" 表示「文字核心主張、短影音視覺內容描述」與背景知識一致，或「背景知識」不足以支持真假判斷時，不可自行推測，亦判斷為 0。
+  - "1" 表示「文字核心主張、短影音視覺內容描述」與「背景知識」明顯矛盾、圖文不符，或已被背景知識證實為假。
+
+  輸出格式範例如下：
+  {"pred_label": 0, "conf": 0.999, "reason": "短影音的文字核心主張與視覺內容描述均與背景知識完全一致。背景知識證實了事故發生日期與起因。因此，該內容為真實資訊。"}
