@@ -39,3 +39,6 @@ backend/output/
 
 # Local database
 *.sqlite3
+
+data/
+pet-runs/
