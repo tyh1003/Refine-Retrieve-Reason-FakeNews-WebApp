@@ -1,0 +1,35 @@
+# Web Backend
+Flask
+flask-cors
+Werkzeug
+
+# Configuration
+PyYAML
+python-dotenv
+certifi
+
+# Gemini / Retrieval
+google-genai
+pydantic
+pandas
+
+# Machine Learning / LLM
+torch
+transformers
+peft
+accelerate
+bitsandbytes
+safetensors
+sentencepiece
+
+# Image / Video Processing
+opencv-python
+numpy
+scikit-image
+
+# OCR
+paddleocr
+python-Levenshtein
+
+# Utilities
+tqdm
