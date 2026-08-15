@@ -4,7 +4,14 @@ An interactive web application for **multimodal short-video misinformation detec
 
 The application provides a visual interface for uploading short-form videos, making an initial human judgment, tracking multimodal analysis progress, reviewing retrieved evidence, and comparing the final AI fact-checking result with the known answer.
 
-> This repository focuses on the **web application and inference pipeline integration**.  
+> This repository focuses on the **web application and inference pipeline integration**.
+
+## Demo
+
+https://github.com/user-attachments/assets/cd75dd21-5c2d-44c3-9ff7-665d47ffa7a5
+
+## Interface
+
 > Model training, knowledge distillation, DSPy prompt optimization, and detailed experimental implementation are outside the main scope of this repository.
 
 <img width="2032" height="1333" alt="image (2)" src="https://github.com/user-attachments/assets/7bd9adb6-7462-4853-ae05-45877576e381" />
@@ -631,7 +638,6 @@ Create a `.env` file and add:
 GEMINI_API_KEY=your_gemini_api_key
 ```
 
-Do not commit API credentials to Git.
 
 ---
 
@@ -716,45 +722,6 @@ The research explores:
 The **Refine–Retrieve–Reason** design separates multimodal evidence preparation from final reasoning, allowing the application to combine the capabilities of a large multimodal model with a smaller fine-tuned model.
 
 For this repository, the emphasis is on **turning the resulting inference framework into an accessible, observable, and interactive web application** rather than documenting the complete training and experimental methodology.
-
----
-
-# Purpose
-
-The project aims to make multimodal misinformation detection easier to interact with and understand.
-
-Instead of simply asking an AI:
-
-```text
-Is this video fake?
-```
-
-the application creates an interactive fact-checking process:
-
-```text
-What do YOU think?
-        │
-        ▼
-   Real or Fake?
-        │
-        ▼
-What does the video claim?
-        │
-        ▼
-What does the video actually show?
-        │
-        ▼
-What relevant evidence can be found?
-        │
-        ▼
-Does the evidence support the claim?
-        │
-        ▼
-What does the AI think?
-        │
-        ▼
-Human vs. AI vs. Ground Truth
-```
 
 This provides a more interpretable and engaging fact-checking experience while demonstrating how a **Refine–Retrieve–Reason evidence chain** can be integrated into a practical web application.
 
