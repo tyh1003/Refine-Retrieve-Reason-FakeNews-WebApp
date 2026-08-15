@@ -6,6 +6,9 @@ The application provides a visual interface for uploading short-form videos, mak
 
 > This repository focuses on the **web application and inference pipeline integration**.
 
+> **Looking for the research framework and experimental implementation?**
+> See [Refine-Retrieve-Reason-FakeNews](https://github.com/shihalex/ExMRD_Project.git).
+
 ## Demo
 
 https://github.com/user-attachments/assets/cd75dd21-5c2d-44c3-9ff7-665d47ffa7a5
@@ -708,6 +711,9 @@ without leaking the correct answer into the inference process.
 # Research Background
 
 This web application is the interactive interface for a broader research project on low-cost, evidence-driven multimodal short-video misinformation detection.
+
+The complete research pipeline, experimental implementation, DSPy optimization, evaluation scripts, and baseline comparisons are available in the [Refine-Retrieve-Reason-FakeNews](https://github.com/shihalex/ExMRD_Project.git) repository.
+
 
 The research explores:
 
