@@ -1,7 +1,9 @@
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -11,15 +13,35 @@ from status_store import process_status, reset_status, update_status
 from vote_api import vote_bp
 
 
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
+load_dotenv(os.path.join(PROJECT_DIR, ".env"), override=False)
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 ANSWER_PATH = os.path.join(PROJECT_DIR, "answer.jsonl")
 ANSWER_NOT_FOUND_TEXT = "找不到對應答案"
 
+from translator import translate_to_english
+
 app = Flask(__name__)
-CORS(app)
+# Non-development deployments default to same-origin only. Values are exact
+# browser origins (scheme + host + port), not regexes or API paths.
+IS_DEVELOPMENT = os.getenv("APP_ENV", "development").strip().lower() == "development"
+default_origins = (
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "http://localhost:4173,http://127.0.0.1:4173"
+    if IS_DEVELOPMENT else ""
+)
+allowed_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", default_origins).split(",")
+    if origin.strip()
+]
+if any("*" in origin for origin in allowed_origins):
+    raise ValueError("CORS_ALLOWED_ORIGINS requires explicit origins; wildcards are not allowed")
+CORS(app, origins=[re.compile("^" + re.escape(origin) + "$") for origin in allowed_origins])
 app.register_blueprint(vote_bp)
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -161,6 +183,30 @@ def add_student_compat_fields(data):
 
     return result
 
+@app.route("/translate", methods=["POST"])
+def translate():
+    data = request.get_json(silent=True) or {}
+    texts = data.get("texts", {})
+
+    if not isinstance(texts, dict) or not texts:
+        return jsonify({
+            "success": False,
+            "error": "texts must be a non-empty JSON object"
+        }), 400
+
+    try:
+        translated = translate_to_english(texts)
+
+        return jsonify({
+            "success": True,
+            "translations": translated
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
 
 @app.route("/")
 def home():
@@ -245,6 +291,8 @@ def get_student_result():
 
 if __name__ == "__main__":
     app.run(
-        debug=True,
+        host=os.getenv("FLASK_HOST", "0.0.0.0"),
+        port=int(os.getenv("FLASK_PORT", "5000")),
+        debug=IS_DEVELOPMENT and os.getenv("FLASK_DEBUG", "0").lower() in {"1", "true", "yes"},
         use_reloader=False,
     )

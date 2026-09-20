@@ -1,147 +1,237 @@
 import os
+import sys
 import json
 import time
 import re
-import threading
-import pandas as pd
-from tqdm import tqdm
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
-import glob
-
-import sys
-
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except:
-    pass
-
-print("Retrieve Start")
-print(os.getcwd())
-
-# Config - 使用 os.path.join 確保 Windows 斜線相容性
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-INPUT_PATH = os.path.join(
-    "preprocess_output",
-    "all.json"
-)
-IMAGE_ROOT = os.path.join(
-    "preprocess_output",
-    "frames_16"
-)
-OUTPUT_DIR = os.path.join(
-    BASE_DIR,
-    "output"
-)
-SAVE_PATH = os.path.join(OUTPUT_DIR, "retrieve.jsonl")
-DEBUG_PATH = os.path.join(OUTPUT_DIR, "retrieve_debug.jsonl")
-FAILED_PATH = os.path.join(OUTPUT_DIR, "retrieve_failed.jsonl")
-
-REQUEST_TIMEOUT = 240
-# MODEL_NAME = "gemma-4-31b-it"
-MODEL_NAME = "gemini-3.1-flash-lite"
-# MODEL_NAME = "gemini-2.5-flash-lite"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-load_dotenv()
-
-# 讀取 API 金鑰
-API_KEYS = [
-    os.getenv("GEMINI_API_KEY")
-]
 
 
-# Schema
-class UnifiedResponse(BaseModel):
-    Rc: str = Field(description="整理後的文字資訊，提取核心內容並保留關鍵細節")
-    Rv: str = Field(description="根據影像時間序列描述的視覺內容")
-    K_int: str = Field(description="根據內部知識整理的背景知識")
-    K_ext: str = Field(description="透過 Google Search 工具搜尋整理的外部背景知識")
+# ============================================================
+# 基本設定
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+PREPROCESS_DIR = BASE_DIR / "preprocess_output"
+INPUT_PATH = PREPROCESS_DIR / "all.json"
+IMAGE_ROOT = PREPROCESS_DIR / "frames"
+
+OUTPUT_DIR = BASE_DIR / "output"
+SAVE_PATH = OUTPUT_DIR / "retrieve.jsonl"
+SENT_PATH = OUTPUT_DIR / "retrieve_sent.jsonl"
+FAILED_PATH = OUTPUT_DIR / "retrieve_failed.jsonl"
+RECEIVE_DIR = OUTPUT_DIR / "retrieve_receive"
+
+MODEL_NAME = "gemma-4-31b-it"
+
+# 單次 API 最長等待時間
+REQUEST_TIMEOUT = 600
+
+# API 失敗重試次數
+MAX_RETRIES = 3
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+RECEIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+PROJECT_DIR = BASE_DIR.parent
+
+load_dotenv(PROJECT_DIR / ".env")
+
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not API_KEY:
+    raise RuntimeError(
+        "找不到 GEMINI_API_KEY，請確認 backend/.env 中已設定 GEMINI_API_KEY。"
+    )
 
 
-# Functions
-def read_input_json(path):
+# ============================================================
+# JSON 工具
+# ============================================================
 
-    if not os.path.exists(path):
-        return pd.DataFrame()
+def load_json(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(f"找不到檔案: {path}")
 
-    with open(path, "r", encoding="utf-8") as f:
-
-        data = json.load(f)
-
-    # 如果只有單筆資料
-    if isinstance(data, dict):
-        data = [data]
-
-    return pd.DataFrame(data)
-
-def read_jsonl(path):
-
-    if not os.path.exists(path):
-        return pd.DataFrame()
-
-    rows = []
-
-    with open(path, "r", encoding="utf-8") as f:
-
-        for line in f:
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            rows.append(json.loads(line))
-
-    return pd.DataFrame(rows)
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def append_jsonl(path, obj):
-    with open(path, "a", encoding="utf-8") as f:
+def append_jsonl(path: Path, obj):
+    with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+def remove_existing_vid_from_jsonl(path: Path, vid: str):
+    """
+    WebApp 一次只分析一支影片。
+    若同 vid 曾經存在，先移除舊結果，避免 pipeline 讀到 stale result。
+    """
+    if not path.exists():
+        return
+
+    kept = []
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if str(obj.get("vid", "")) != str(vid):
+                    kept.append(obj)
+
+        with path.open("w", encoding="utf-8") as f:
+            for obj in kept:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    except Exception as e:
+        print(f"[Warning] 清理舊 JSONL 失敗: {path} | {e}")
+
+
+# ============================================================
+# Gemma 原始回傳
+# ============================================================
+
+def save_model_response(vid, response):
+    receive_path = RECEIVE_DIR / f"{vid}.txt"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    with receive_path.open("a", encoding="utf-8") as f:
+        f.write(
+            f"==================== RESPONSE {timestamp} ====================\n"
+        )
+        f.write(str(response))
+        f.write("\n")
+        f.write("==================== END RESPONSE ====================\n\n")
+
+
+# ============================================================
+# API 錯誤處理
+# ============================================================
+
 def extract_retry_delay_429(error_msg):
-    match = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+)s", error_msg)
+    match = re.search(
+        r"retryDelay['\"]?\s*:\s*['\"]?(\d+)s",
+        error_msg
+    )
+
     if match:
         return int(match.group(1))
+
     return 60
 
 
-def load_image_bytes(path):
-    if not os.path.exists(path):
+# ============================================================
+# 圖片讀取
+# ============================================================
+
+def load_image_bytes(path: Path):
+    if not path.exists():
         return None
 
-    with open(path, "rb") as f:
-        data = f.read()
+    try:
+        data = path.read_bytes()
+
         if not data:
-            print(f"[{time.strftime('%H:%M:%S')}] [警告] [Empty Image] {path}")
             return None
+
         return data
 
+    except Exception as e:
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[圖片讀取失敗] {path} | {e}"
+        )
+        return None
+
+
+# ============================================================
+# Google Search Grounding Metadata
+# ============================================================
 
 def extract_grounding_metadata(response):
     queries = []
     uris = []
-    try:
-        grounding = response.candidates[0].grounding_metadata
-        if hasattr(grounding, "web_search_queries"):
-            queries = grounding.web_search_queries or []
 
-        if hasattr(grounding, "grounding_chunks"):
-            for chunk in grounding.grounding_chunks:
-                web_info = getattr(chunk, "web", None)
-                if not web_info:
-                    continue
-                if getattr(web_info, "uri", None):
-                    uris.append(web_info.uri)
-    except:
-        pass
+    try:
+        if not response.candidates:
+            print("[Grounding Debug] 沒有 candidates")
+            return {
+                "query": [],
+                "uri": []
+            }
+
+        candidate = response.candidates[0]
+
+        grounding = getattr(
+            candidate,
+            "grounding_metadata",
+            None
+        )
+
+        print("[Grounding Debug] grounding_metadata:")
+        print(grounding)
+
+        if grounding is None:
+            print("[Grounding Debug] grounding_metadata = None")
+
+            return {
+                "query": [],
+                "uri": []
+            }
+
+        queries = (
+            getattr(
+                grounding,
+                "web_search_queries",
+                None
+            )
+            or []
+        )
+
+        chunks = (
+            getattr(
+                grounding,
+                "grounding_chunks",
+                None
+            )
+            or []
+        )
+
+        print("[Grounding Debug] web_search_queries:")
+        print(queries)
+
+        print("[Grounding Debug] grounding_chunks:")
+        print(chunks)
+
+        for chunk in chunks:
+            web_info = getattr(chunk, "web", None)
+
+            if web_info is None:
+                continue
+
+            uri = getattr(web_info, "uri", None)
+
+            if uri:
+                uris.append(uri)
+
+    except Exception as e:
+        print(
+            f"[Grounding Debug] 解析失敗: {repr(e)}"
+        )
 
     return {
         "query": list(dict.fromkeys(queries)),
@@ -149,29 +239,39 @@ def extract_grounding_metadata(response):
     }
 
 
-# Prompt
+# ============================================================
+# System Prompt
+# ============================================================
+
 SYSTEM_PROMPT = """
 你是一個多模態訊息分析與事實查核系統。你必須依序完成以下的任務，並且嚴格的遵守每個任務的限制與共同限制。
+
 
 共同限制：
 - 必須保持客觀
 - 不可推測與幻想不存在的內容
 - 所有輸出都以純文字輸出
 - 所有輸出都必須以繁體中文輸出
+- 依照指定的 JSON 格式輸出，不要包含任何 Markdown 區塊標記（如 ```json）以及其他欄位
+- 時間須避免今日、昨日、明日、今年、本月等相對時間的描述，使用準確日期或時間點
 
-任務一(Rc)：整理輸入的文本資訊，提取核心內容並保留關鍵細節，且須移除文本中的雜訊。
+
+任務一(Rc)：整理輸入的文本資訊，提取其核心內容並保留關鍵細節，且須移除文本中的雜訊。
 任務一限制：
-- 只能使用文本資訊，不可參考影像
+- 只能使用輸入之文本資訊，不可參考其他任何資訊
 - 不可摘要整段內容
 - 需保留文本中的關鍵細節（如人物、事件、時間、地點等）
-- 時間須避免今日、昨日等相對時間的描述，使用準確日期或時間點
 
-任務二(Rv)：考慮時間序列來描述影像中的視覺內容。
+
+任務二(Rv)：根據 Rc, vision 以及輸入的影像，補足影片完整資訊。
 任務二限制：
-- 只能使用影像資訊，不可參考文本資訊
-- 僅描述可直接觀察到的內容（人物、物件、動作、場景）
-- 必須考慮時間序列，描述事件的發展過程，而非單一靜態畫面
-- 避免每張影像獨立描述，應綜合多張影像來理解事件的演變
+- 只能使用 Rc, vision 與輸入的影像，不可參考其他任何資訊
+- 應綜合 Rc, vision 與輸入的影像，補足人物、物件、動作、場景、事件發展以及其他與影片內容相關的重要資訊
+- 必須考慮影片的時間序列與事件發展過程，不可將輸入影像視為互不相關的獨立影像
+- 當 vision 與輸入影像提供互補資訊時，應整合兩者以補足影片內容
+- 當 vision 中的資訊無法由輸入影像直接確認時，不可自行增加額外推測
+- 不可幻想或加入 Rc, vision 與影像皆未提供的資訊
+
 
 任務三(K_int):根據 Rc 與 Rv 的內容，輸出能用於事實查核之相關背景知識。
 任務三限制：
@@ -179,43 +279,140 @@ SYSTEM_PROMPT = """
 - 不要出現任何說明性語句，直接給出與內容相關的背景知識
 - 內容應具權威性，避免不可靠或爭議性的資訊
 
-任務四(K_ext):根據 Rc 與 Rv 的內容，使用 Google Search tool 工具搜尋並整理能用於事實查核之相關背景知識。
+
+任務四(K_ext):根據 Rc 與 Rv 的內容，使用 Web Search tool 工具搜尋並整理能用於事實查核之相關背景知識。
 任務四限制：
-- 必須使用 Google Search tool 工具進行搜尋，禁止直接使用內部知識
+- **重要**：本次任務事關重大，務必確保你使用 Web Search tool 進行搜尋，禁止直接使用內部知識
+- **重要**: 必須確保你有使用 query 搜尋權威性的 URI 才能整理出 K_ext 的內容
+- 必須根據 Rc 和 Rv 的內容來決定搜尋的 query，禁止無差別搜尋
+- 搜尋的內容需要包含與該次的事件，以及與該事件內容相關的領域知識
+- 搜尋的 URI 來源需要具有權威性，且只整理與事件相關的資訊，避免無關或不可靠的內容
 - 不要出現任何說明性語句，直接給出與內容相關的背景知識
 - 搜尋結果須與 Rc 和 Rv 的內容相關，著重於該次事件、人物、地點、內容等的相關背景知識
-- 只整理與事件相關且具權威性的資訊，避免無關或不可靠的內容
+
+
+請嚴格依照以下 JSON 格式回傳，確保鍵值（Keys）名稱完全一致：
+{
+  "Rc": "任務一的繁體中文輸出內容...",
+  "Rv": "任務二的繁體中文輸出內容...",
+  "K_int": "任務三的繁體中文輸出內容...",
+  "K_ext": "任務四的繁體中文輸出內容..."
+}
 """
+
+
+# ============================================================
+# User Prompt
+# ============================================================
 
 USER_PROMPT_TEMPLATE = """
-使用前面輸入的影像順序與下方的文本資訊，嚴格遵守每個任務的限制與共同限制，並依序完成所有任務。
+使用前面輸入的影像順序與下方提供的資訊，嚴格遵守每個任務的限制與共同限制，並依序完成所有任務。
 
 文本資訊：
-- 標題:{title}
-- 影像內文字：{ocr}
-- 語音轉錄:{transcript}
+- 語音轉錄：{transcript}
+
+完整影片視覺描述：
+- vision：{vision}
 
 影像與時間軸說明：
-- 前方附加的影像中，第一張影像為最早的時間點，最後一張影像為最晚時間點
-- 請根據時間順序理解事件發展
+- 前方附加的影像按照影片時間順序排列
+- 第一張影像為最早的時間點，最後一張影像為最晚時間點
 """
 
 
-# LLM
-def count_input_tokens(api_key, contents):
+# ============================================================
+# 建立 Gemma 輸入
+# ============================================================
+
+def prepare_inputs(data, vid):
+    transcript = str(
+        data.get("transcript") or ""
+    ).strip()
+
+    # Data_Merge 的 description 就是原本 VLM.jsonl 的 vision
+    vision = str(
+        data.get("description") or ""
+    ).strip()
+
+    frame_dir = IMAGE_ROOT / vid
+
+    contents = []
+    loaded_image_paths = []
+
+    # 保留原研究設計：16 張 temporal frames
+    for i in range(16):
+        image_path = frame_dir / f"frame_{i:04d}.png"
+
+        img_bytes = load_image_bytes(image_path)
+
+        if img_bytes is None:
+            continue
+
+        contents.append(
+            types.Part.from_bytes(
+                data=img_bytes,
+                mime_type="image/png"
+            )
+        )
+
+        loaded_image_paths.append(str(image_path))
+
+    prompt = USER_PROMPT_TEMPLATE.format(
+        transcript=transcript,
+        vision=vision
+    )
+
+    contents.append(prompt)
+
+    return (
+        transcript,
+        vision,
+        prompt,
+        contents,
+        loaded_image_paths
+    )
+
+
+# ============================================================
+# Input Token 計算
+# ============================================================
+
+def count_input_tokens(contents):
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.count_tokens(model=MODEL_NAME, contents=contents)
+        client = genai.Client(api_key=API_KEY)
+
+        response = client.models.count_tokens(
+            model=MODEL_NAME,
+            contents=contents
+        )
+
         return int(response.total_tokens)
+
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] [錯誤] Token 計算失敗: {str(e)}")
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[Warning] Token 計算失敗: {e}"
+        )
+
         return -1
 
 
-def generate_with_client(api_key, contents, vid):
+# ============================================================
+# Gemma API 呼叫
+# ============================================================
+
+def generate_with_client(contents, vid):
     t_start = time.time()
-    print(f"[{time.strftime('%H:%M:%S')}] [LLM發送] [vid: {vid}] 開始建立 Client 並發送 generate_content...")
-    client = genai.Client(api_key=api_key)
+
+    print(
+        f"[{time.strftime('%H:%M:%S')}] "
+        f"[LLM發送] [vid: {vid}] "
+        f"開始呼叫 {MODEL_NAME}..."
+    )
+
+    client = genai.Client(api_key=API_KEY)
+
+    raw_text = ""
 
     try:
         response = client.models.generate_content(
@@ -223,255 +420,479 @@ def generate_with_client(api_key, contents, vid):
             contents=contents,
             config=types.GenerateContentConfig(
                 temperature=0.0,
-                tools=[{"google_search": {}}],
+                tools=[
+                    {
+                        "google_search": {}
+                    }
+                ],
                 system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                response_schema=UnifiedResponse,
             )
         )
 
-        print(f"[{time.strftime('%H:%M:%S')}] [LLM接收] [vid: {vid}] 成功取得回應！耗時: {round(time.time()-t_start, 2)} 秒")
+        # 保存完整 API Response
+        save_model_response(vid, response)
 
-        raw_text = ""
+        print("========== FULL RESPONSE ==========")
+        print(response)
+        print("===================================")
+
+        elapsed = round(
+            time.time() - t_start,
+            2
+        )
+
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[LLM接收] [vid: {vid}] "
+            f"成功取得回應，耗時 {elapsed} 秒"
+        )
+
         try:
             raw_text = response.text
-        except:
-            raw_text = str(response)
 
-        data = json.loads(raw_text.strip())
-        grounding_info = extract_grounding_metadata(response)
+        except Exception:
+            raw_text = None
+
+        if raw_text is None:
+            return (
+                None,
+                f"RESPONSE_TEXT_IS_NONE | response={response}"
+            )
+
+        raw_text = str(raw_text).strip()
+
+        if not raw_text:
+            return (
+                None,
+                f"RESPONSE_TEXT_IS_EMPTY | response={response}"
+            )
+
+        # 有些模型偶爾仍可能包 markdown fence
+        # 不改研究 prompt，只做 defensive parsing
+        cleaned_text = raw_text
+
+        if cleaned_text.startswith("```"):
+            cleaned_text = re.sub(
+                r"^```(?:json)?\s*",
+                "",
+                cleaned_text,
+                flags=re.IGNORECASE
+            )
+
+            cleaned_text = re.sub(
+                r"\s*```$",
+                "",
+                cleaned_text
+            )
+
+            cleaned_text = cleaned_text.strip()
+
+        try:
+            data = json.loads(cleaned_text)
+
+        except json.JSONDecodeError as e:
+            return (
+                None,
+                f"JSON_PARSE_ERROR: {e} | raw_response={raw_text}"
+            )
+
+        if not isinstance(data, dict):
+            return (
+                None,
+                f"RESPONSE_JSON_IS_NOT_OBJECT | raw_response={raw_text}"
+            )
+
+        # 四個研究欄位至少必須存在
+        required_keys = {
+            "Rc",
+            "Rv",
+            "K_int",
+            "K_ext"
+        }
+
+        missing_keys = required_keys - set(data.keys())
+
+        if missing_keys:
+            return (
+                None,
+                f"MISSING_KEYS: {sorted(missing_keys)} "
+                f"| raw_response={raw_text}"
+            )
+
+        grounding_info = extract_grounding_metadata(
+            response
+        )
 
         result = {
-            "Rc": data.get("Rc", "").strip(),
-            "Rv": data.get("Rv", "").strip(),
-            "K_int": str(data.get("K_int", "")).strip(),
-            "K_ext": str(data.get("K_ext", "")).strip(),
-            "query": grounding_info.get("query", []),
-            "uri": grounding_info.get("uri", [])
+            "Rc": str(
+                data.get("Rc") or ""
+            ).strip(),
+
+            "Rv": str(
+                data.get("Rv") or ""
+            ).strip(),
+
+            "K_int": str(
+                data.get("K_int") or ""
+            ).strip(),
+
+            "K_ext": str(
+                data.get("K_ext") or ""
+            ).strip(),
+
+            "query": grounding_info.get(
+                "query",
+                []
+            ),
+
+            "uri": grounding_info.get(
+                "uri",
+                []
+            )
         }
+
         return result, raw_text
 
     except Exception as e:
         error_msg = str(e)
-        print(f"[{time.strftime('%H:%M:%S')}] [API異常] [vid: {vid}] 發生錯誤: {error_msg}")
 
-        if "429" in error_msg:
-            delay = extract_retry_delay_429(error_msg)
-            print(f"[{time.strftime('%H:%M:%S')}] [速率限制] [vid: {vid}] 觸發 429，執行緒將睡眠 {delay} 秒...")
-            time.sleep(delay)
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[API異常] [vid: {vid}] "
+            f"{error_msg}"
+        )
 
         return None, error_msg
 
 
-def read_jsonl(path):
+# ============================================================
+# Timeout
+# ============================================================
 
-    if not os.path.exists(path):
-        return pd.DataFrame()
+def generate_with_timeout(contents, vid, timeout=REQUEST_TIMEOUT):
+    """
+    注意：
+    ThreadPoolExecutor 的 future.cancel() 無法真正中止
+    已經進行中的 HTTP request。
 
-    rows = []
+    此處 timeout 主要用於讓主流程知道 API 等待過久，
+    並非強制殺掉底層 request。
+    """
 
-    with open(path, "r", encoding="utf-8") as f:
+    executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix=f"Retrieve-{vid}"
+    )
 
-        for line in f:
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            rows.append(json.loads(line))
-
-    return pd.DataFrame(rows)
-
-def generate_with_timeout(api_key, contents, vid, timeout=120):
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"TimeoutMonitor-{vid}")
-    future = executor.submit(generate_with_client, api_key, contents, vid)
+    future = executor.submit(
+        generate_with_client,
+        contents,
+        vid
+    )
 
     try:
-        result = future.result(timeout=timeout)
-        executor.shutdown(wait=False)
+        result = future.result(
+            timeout=timeout
+        )
+
+        executor.shutdown(
+            wait=False
+        )
+
         return result
+
     except TimeoutError:
-        print(f"[{time.strftime('%H:%M:%S')}] [Timeout] [vid: {vid}] 超過 {timeout} 秒")
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[Timeout] [vid: {vid}] "
+            f"超過 {timeout} 秒"
+        )
+
         future.cancel()
-        executor.shutdown(wait=False)
-        print(f"[{time.strftime('%H:%M:%S')}] [Active Threads] {threading.active_count()}")
-        return None, f"TIMEOUT_AFTER_{timeout}s"
+
+        executor.shutdown(
+            wait=False
+        )
+
+        return (
+            None,
+            f"TIMEOUT_AFTER_{timeout}s"
+        )
+
     except Exception as e:
-        executor.shutdown(wait=False)
-        print(f"[{time.strftime('%H:%M:%S')}] [子執行緒異常] [vid: {vid}] {repr(e)}")
+        executor.shutdown(
+            wait=False
+        )
+
         return None, repr(e)
 
 
-# 全域鎖定與狀態追蹤
-lock = threading.Lock()
-processed_vids = set()
-in_progress_vids = set()
+# ============================================================
+# Retry
+# ============================================================
 
+def generate_with_retry(contents, vid):
+    last_error = None
 
-def process_row(args):
-    global processed_vids, in_progress_vids
-    start_time = time.time()
-    row, api_key = args
-    vid = str(row["vid"])
-    key_hint = f"...{api_key[-6:]}" if api_key else "None"
-
-    print(f"[{time.strftime('%H:%M:%S')}] [任務喚醒] [vid: {vid}] 使用金鑰 {key_hint} 開始進入工作排程")
-
-    with lock:
-        if (vid in processed_vids or vid in in_progress_vids):
-            return None
-        in_progress_vids.add(vid)
-
-    try:
-        title = str(row.get("title", "")).strip()
-        ocr = str(row.get("ocr", "")).strip()
-        transcript = str(row.get("transcript", "")).strip()
-
-        prompt = USER_PROMPT_TEMPLATE.format(title=title, ocr=ocr, transcript=transcript)
-
-        contents = []
-
-
-        image_paths = sorted(
-            glob.glob(
-                os.path.join(
-                    IMAGE_ROOT,
-                    vid,
-                    "*.png"
-                )
-            )
+    for attempt in range(
+        1,
+        MAX_RETRIES + 1
+    ):
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[Retrieve] "
+            f"Attempt {attempt}/{MAX_RETRIES}"
         )
 
-        for p in image_paths:
+        result, raw_text = generate_with_timeout(
+            contents,
+            vid,
+            timeout=REQUEST_TIMEOUT
+        )
 
-            img_bytes = load_image_bytes(p)
+        if result is not None:
+            return result, raw_text
 
-            if img_bytes is None:
-                continue
+        last_error = raw_text
 
-            contents.append(
-                types.Part.from_bytes(
-                    data=img_bytes,
-                    mime_type="image/png"
-                )
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[Retrieve失敗] "
+            f"Attempt {attempt}: {raw_text}"
+        )
+
+        if attempt >= MAX_RETRIES:
+            break
+
+        # 429：依 API 建議時間等待
+        if raw_text and "429" in raw_text:
+            delay = extract_retry_delay_429(
+                raw_text
             )
 
-        contents.append(prompt)
-        input_tokens = count_input_tokens(api_key, contents)
-        result, raw_text = generate_with_timeout(api_key, contents, vid, timeout=REQUEST_TIMEOUT)
+        # 500 / 503 / timeout：短暫 backoff
+        else:
+            delay = 10 * attempt
 
-        if result is None:
-            print(f"[{time.strftime('%H:%M:%S')}] [寫入錯誤檔] [vid: {vid}] API 回傳失敗，將寫入 Failed Log")
-            with lock:
-                append_jsonl(FAILED_PATH, {"vid": vid, "token": input_tokens, "reason": raw_text})
-            return None
+        print(
+            f"[{time.strftime('%H:%M:%S')}] "
+            f"[Retry] {delay} 秒後重試..."
+        )
 
-        '''
-        # ==================== 【關鍵修改處：攔截空 Query】 ====================
-        if not result.get("query"):
-            print(f"[{time.strftime('%H:%M:%S')}] [攔截空Query] [vid: {vid}] Google Search 檢索關鍵字為空！")
-            with lock:
-                append_jsonl(
-                    FAILED_PATH,
-                    {
-                        "vid": vid,
-                        "token": input_tokens,
-                        "reason": "EMPTY_SEARCH_QUERY: Model did not execute web search or failed to return queries.",
-                        "raw_response": raw_text
-                    }
-                )
-            return None
-        # ===================================================================
-        '''
+        time.sleep(delay)
 
-        elapsed_time = round(time.time() - start_time, 4)
-        save_obj = {
+    return None, last_error
+
+
+# ============================================================
+# 主流程
+# ============================================================
+
+def main():
+    print("=" * 60)
+    print("Retrieve")
+    print(f"Model: {MODEL_NAME}")
+    print(f"Input: {INPUT_PATH}")
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # 讀取 Data_Merge 結果
+    # --------------------------------------------------------
+
+    data = load_json(INPUT_PATH)
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "preprocess_output/all.json 格式錯誤，必須為 JSON object。"
+        )
+
+    vid = str(
+        data.get("vid") or ""
+    ).strip()
+
+    transcript = str(
+        data.get("transcript") or ""
+    ).strip()
+
+    description = str(
+        data.get("description") or ""
+    ).strip()
+
+    if not vid:
+        raise RuntimeError(
+            "all.json 缺少 vid。"
+        )
+
+    print(f"VID: {vid}")
+    print(f"Transcript chars: {len(transcript)}")
+    print(f"Description chars: {len(description)}")
+
+    # --------------------------------------------------------
+    # 清掉同 vid 舊紀錄
+    # --------------------------------------------------------
+
+    remove_existing_vid_from_jsonl(
+        SAVE_PATH,
+        vid
+    )
+
+    remove_existing_vid_from_jsonl(
+        SENT_PATH,
+        vid
+    )
+
+    remove_existing_vid_from_jsonl(
+        FAILED_PATH,
+        vid
+    )
+
+    # --------------------------------------------------------
+    # 建立 multimodal input
+    # --------------------------------------------------------
+
+    (
+        transcript,
+        vision,
+        prompt,
+        contents,
+        loaded_image_paths
+    ) = prepare_inputs(
+        data,
+        vid
+    )
+
+    print(
+        f"Loaded frames: "
+        f"{len(loaded_image_paths)}/16"
+    )
+
+    if len(loaded_image_paths) == 0:
+        raise RuntimeError(
+            f"找不到任何 frame: {IMAGE_ROOT / vid}"
+        )
+
+    # 正常 pipeline 應該有完整 16 張
+    if len(loaded_image_paths) < 16:
+        print(
+            f"[Warning] 預期 16 張 frame，"
+            f"目前只有 {len(loaded_image_paths)} 張。"
+        )
+
+    # --------------------------------------------------------
+    # Token 計算
+    # --------------------------------------------------------
+
+    token = count_input_tokens(
+        contents
+    )
+
+    print(f"Input token: {token}")
+
+    # --------------------------------------------------------
+    # 保存實際送給 Retrieve 的資料
+    # --------------------------------------------------------
+
+    sent_obj = {
+        "vid": vid,
+        "token": token,
+        "transcript": transcript,
+        "vision": vision,
+        "prompt": prompt,
+        "image_count": len(
+            loaded_image_paths
+        ),
+        "image_paths": loaded_image_paths
+    }
+
+    append_jsonl(
+        SENT_PATH,
+        sent_obj
+    )
+
+    # --------------------------------------------------------
+    # Gemma + Google Search
+    # --------------------------------------------------------
+
+    start_time = time.time()
+
+    result, raw_text = generate_with_retry(
+        contents,
+        vid
+    )
+
+    # --------------------------------------------------------
+    # Failure
+    # --------------------------------------------------------
+
+    if result is None:
+        elapsed = round(
+            time.time() - start_time,
+            4
+        )
+
+        failed_obj = {
             "vid": vid,
-            "token": input_tokens,
-            "time": elapsed_time,
-            **result
+            "input_token": token,
+            "time": elapsed,
+            "reason": raw_text
         }
 
-        debug_obj = {
-            "vid": vid,
-            "token": input_tokens,
-            "prompt": prompt,
-            "image_paths": image_paths,
-            "raw_response": raw_text,
-            "grounding": {
-                "query": result.get("query", []),
-                "uri": result.get("uri", [])
-            }
-        }
+        append_jsonl(
+            FAILED_PATH,
+            failed_obj
+        )
 
-        print(f"[{time.strftime('%H:%M:%S')}] [準備存檔] [vid: {vid}] 處理完畢，正在等待 I/O 鎖定進行寫入...")
-        with lock:
-            append_jsonl(SAVE_PATH, save_obj)
-            append_jsonl(DEBUG_PATH, debug_obj)
-            processed_vids.add(vid)
+        print("=" * 60)
+        print("Retrieve FAILED")
+        print(f"VID: {vid}")
+        print(f"Reason: {raw_text}")
+        print("=" * 60)
 
-        print(f"[{time.strftime('%H:%M:%S')}] [存檔成功] [vid: {vid}] 資料已成功永久化儲存。")
-        return vid
-
-    except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] [執行緒崩潰] [vid: {vid}] 拋出未捕捉異常: {str(e)}")
-        with lock:
-            append_jsonl(FAILED_PATH, {"vid": vid, "reason": str(e)})
-        return None
-    finally:
-        with lock:
-            in_progress_vids.discard(vid)
-
-
-# ---------------- Windows 執行核心保護 ----------------
-if __name__ == "__main__":
-    print(f"[{time.strftime('%H:%M:%S')}] [系統啟動] 正在初始化環境變數與檔案進度...")
-
-    if not API_KEYS:
-        print(f"[{time.strftime('%H:%M:%S')}] [嚴重錯誤] 找不到任何合法的 GEMINI_API_KEY_X！")
-        import sys
         sys.exit(1)
 
-    print(f"[{time.strftime('%H:%M:%S')}] [金鑰就緒] 成功載入 {len(API_KEYS)} 個 API Key。")
+    # --------------------------------------------------------
+    # Success
+    # --------------------------------------------------------
 
-    save_df = read_jsonl(SAVE_PATH)
-    if not save_df.empty:
-        processed_vids = set(save_df["vid"].astype(str))
+    elapsed = round(
+        time.time() - start_time,
+        4
+    )
 
-    print(f"[{time.strftime('%H:%M:%S')}] [進度載入] 已跳過 {len(processed_vids)} 筆已處理項目。")
+    save_obj = {
+        "vid": vid,
+        "token": token,
+        "time": elapsed,
+        **result
+    }
 
-    df = read_input_json(INPUT_PATH)
-    if df.empty:
-        raise RuntimeError(f"{INPUT_PATH} is empty or does not exist.")
+    append_jsonl(
+        SAVE_PATH,
+        save_obj
+    )
 
-    df["vid"] = df["vid"].astype(str)
+    print("=" * 60)
+    print("Retrieve Done")
+    print(f"VID: {vid}")
+    print(f"Time: {elapsed} sec")
+    print(f"Rc chars: {len(result['Rc'])}")
+    print(f"Rv chars: {len(result['Rv'])}")
+    print(f"K_int chars: {len(result['K_int'])}")
+    print(f"K_ext chars: {len(result['K_ext'])}")
+    print(f"Search queries: {len(result['query'])}")
+    print(f"Grounding URIs: {len(result['uri'])}")
+    print(f"Saved: {SAVE_PATH}")
+    print("=" * 60)
 
-    df = df[~df["vid"].isin(processed_vids)]
-    df = df.reset_index(drop=True)
 
-    if len(df) == 0:
-        print(f"[{time.strftime('%H:%M:%S')}] [完工] 所有資料皆已處理完畢！")
-        import sys
-        sys.exit(0)
+if __name__ == "__main__":
+    try:
+        main()
 
-    tasks = [
-        (row, API_KEYS[i % len(API_KEYS)])
-        for i, (_, row) in enumerate(df.iterrows())
-    ]
+    except Exception as e:
+        print("=" * 60)
+        print("Retrieve ERROR")
+        print(str(e))
+        print("=" * 60)
 
-    print(f"[{time.strftime('%H:%M:%S')}] [執行緒準備] 剩餘總工作數: {len(tasks)}，平行執行緒上限: {len(API_KEYS)}")
-    success = 0
-
-    with ThreadPoolExecutor(max_workers=len(API_KEYS), thread_name_prefix="MainWorker") as executor:
-        futures = [executor.submit(process_row, t) for t in tasks]
-
-        for f in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
-            try:
-                result = f.result()
-                if result is not None:
-                    success += 1
-            except Exception as e:
-                print(f"\n[{time.strftime('%H:%M:%S')}] [主池回報異常] Future 收集發生錯誤: {str(e)}")
-
-    print(f"\n[{time.strftime('%H:%M:%S')}] [腳本終點] 執行完畢！本次成功處理: {success} 筆資料。")
+        sys.exit(1)

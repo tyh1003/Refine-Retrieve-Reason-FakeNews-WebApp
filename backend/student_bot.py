@@ -78,115 +78,161 @@ class StudentBot:
             return "無"
         return "\n".join([f"- {x}" for x in items])
 
-    def predict(self, Rc, Rv, K_int=[], K_ext=[]):
-        """
-        給小型機器人調用的預測核心函式
-        :param Rc: 文字核心主張 (String)
-        :param Rv: 視覺內容描述 (String)
-        :param K_int: 內部知識列表 (List)
-        :param K_ext: 外部知識列表 (List)
-        :return: (pred_label, reason, knowledge) 結構化預測結果
-        """
-        # 1. 建立完全契合訓練時的 User Prompt 格式
+    def predict(self, Rc, Rv, K_int=None, K_ext=None):
+
         formatted_k_int = self._format_knowledge_list(K_int)
         formatted_k_ext = self._format_knowledge_list(K_ext)
-        
-        user_prompt = f"""
-        請輸出 JSON 格式：{{"pred_label": 0, "conf": 0.95, "reason": "繁體中文理由"}}
-        conf 必須是 0.0 到 1.0 的信心分數。
-        reason 必須使用繁體中文，不要輸出英文理由。
 
-        短影音資料：
+        # ==================== 從 YAML 建立 User Prompt ====================
 
-        文字核心主張：
-        {Rc}
+        user_prompt_template = self.config.get(
+            "USER_PROMPT_TEMPLATE",
+            ""
+        )
 
-        視覺內容描述：
-        {Rv}
+        if not user_prompt_template:
+            raise ValueError(
+                "student_bot_config.yaml 缺少 USER_PROMPT_TEMPLATE"
+            )
 
-        背景知識：
-        {formatted_k_int}
-        {formatted_k_ext}
+        user_prompt = user_prompt_template.format(
+            Rc=Rc,
+            Rv=Rv,
+            K_int=formatted_k_int,
+            K_ext=formatted_k_ext
+        )
 
-        請嚴格根據背景知識判斷短影音真偽，並輸出 pred_label、conf、reason。
-        """
+        # ==================== Chat Template ====================
 
-        # 2. 套用 Chat Template 封裝對話
-        prompt_text = f"{self.system_prompt}\n\n{user_prompt}"
-        chat_messages = [{"role": "user", "content": prompt_text}]
-        prompt_formatted = self.tokenizer.apply_chat_template(chat_messages, tokenize=False, add_generation_prompt=True)
+        prompt_text = (
+            f"{self.system_prompt}\n\n"
+            f"{user_prompt}"
+        )
 
-        # 3. 轉換為 Tensor 模型的輸入張量
-        inputs = self.tokenizer(prompt_formatted, return_tensors="pt").to(self.model.device)
+        chat_messages = [
+            {
+                "role": "user",
+                "content": prompt_text
+            }
+        ]
 
-        # 4. 生成預測（限制最大生成 token 數，並關閉 use_cache 警告）
+        prompt_formatted = self.tokenizer.apply_chat_template(
+            chat_messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        # ==================== Tokenize ====================
+
+        inputs = self.tokenizer(
+            prompt_formatted,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_length
+        ).to(self.model.device)
+
+        # ==================== Generate ====================
+
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=256,
-                do_sample=False,        # 貪婪解碼，確保真偽標籤與原因輸出的穩定性
+                do_sample=False,
                 eos_token_id=self.tokenizer.eos_token_id,
                 pad_token_id=self.tokenizer.pad_token_id
             )
 
-        # 5. 擷取模型生成的純標籤與 JSON 內容
-        generated_ids = outputs[0][inputs["input_ids"].shape[-1]:]
-        response_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        # ==================== Decode ====================
+
+        generated_ids = outputs[0][
+            inputs["input_ids"].shape[-1]:
+        ]
+
+        response_text = self.tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True
+        ).strip()
+
+        print("\n" + "=" * 60)
+        print("RAW STUDENT OUTPUT")
+        print("=" * 60)
+        print(response_text)
+        print("=" * 60)
+
         pred_label = -1
-        conf = 0
         reason = response_text
 
-        # 6. 安全解析 JSON
-        try:
-            # 找到第一個 '{' 和最後一個 '}' 的位置，確保只抓取 JSON 區塊
-            start_idx = response_text.find('{')
-            end_idx = response_text.rfind('}') + 1
-            if start_idx != -1 and end_idx != -1:
-                json_str = response_text[start_idx:end_idx]
-                res_obj = json.loads(json_str)
-            else:
-                res_obj = json.loads(response_text)
-                
-            pred_label = res_obj.get("pred_label", -1)
-            conf = res_obj.get("conf", res_obj.get("confidence", 0))
-            reason = res_obj.get("reason", "無法解析原因")
-                        
-        except Exception as e:
+        # ==================== JSON Parse ====================
 
+        try:
+            start_idx = response_text.find("{")
+            end_idx = response_text.rfind("}")
+
+            if (
+                start_idx != -1
+                and end_idx != -1
+                and end_idx > start_idx
+            ):
+                json_str = response_text[
+                    start_idx:end_idx + 1
+                ]
+            else:
+                json_str = response_text
+
+            res_obj = json.loads(json_str)
+
+            pred_label = int(
+                res_obj.get("pred_label", -1)
+            )
+
+            reason = str(
+                res_obj.get(
+                    "reason",
+                    "無法解析原因"
+                )
+            ).strip()
+
+        # ==================== Fallback Parse ====================
+
+        except Exception as e:
             import re
+
+            print(
+                f"[StudentBot] JSON parse failed: {e}"
+            )
 
             pred_match = re.search(
                 r'"pred_label"\s*:\s*(\d+)',
                 response_text
             )
 
-            conf_match = re.search(
-                r'"(?:conf|confidence)"\s*:\s*([01](?:\.\d+)?)',
-                response_text
-            )
-
             reason_match = re.search(
-                r'"reason"\s*:\s*"(.+)',
+                r'"reason"\s*:\s*"([^"]*)"',
                 response_text,
                 re.DOTALL
             )
 
             if pred_match:
-                pred_label = int(pred_match.group(1))
-            else:
-                pred_label = -1
-
-            if conf_match:
-                conf = float(conf_match.group(1))
+                pred_label = int(
+                    pred_match.group(1)
+                )
 
             if reason_match:
-                reason = reason_match.group(1)
-            else:
-                reason = response_text
+                reason = (
+                    reason_match
+                    .group(1)
+                    .strip()
+                )
 
-            knowledge = []
+        # ==================== Validate ====================
 
-        return pred_label, conf, reason
+        if pred_label not in (0, 1):
+            print(
+                "[StudentBot Warning] "
+                f"非法 pred_label: {pred_label}"
+            )
+
+        return pred_label, reason
 
 if __name__ == "__main__":
     # 本地或測試時的模擬調用測試

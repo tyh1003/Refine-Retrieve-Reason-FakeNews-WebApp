@@ -18,7 +18,7 @@ with open(
 
 data = json.loads(lines[-1])
 
-label, conf, reason = bot.predict(
+label, reason = bot.predict(
     Rc=data["Rc"],
     Rv=data["Rv"],
     K_int=data["K_int"],
@@ -28,7 +28,6 @@ label, conf, reason = bot.predict(
 result = {
     "vid": data.get("vid"),
     "pred_label": label,
-    "conf": conf,
     "reason": reason,
     "knowledge": [],
 }

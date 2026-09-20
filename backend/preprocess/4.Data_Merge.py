@@ -1,7 +1,6 @@
 import os
 import json
-import glob
-import shutil
+import sys
 
 
 # =========================
@@ -10,14 +9,14 @@ import shutil
 
 ROOT_DIR = "preprocess_output"
 
-OCR_DIR = os.path.join(
-    ROOT_DIR,
-    "ocr"
-)
-
 TRANSCRIPT_DIR = os.path.join(
     ROOT_DIR,
     "transcript"
+)
+
+VLM_DIR = os.path.join(
+    ROOT_DIR,
+    "vlm"
 )
 
 OUTPUT_FILE = os.path.join(
@@ -50,67 +49,68 @@ def load_json(path):
 
 def main():
 
-    transcript_files = glob.glob(
-        os.path.join(
-            TRANSCRIPT_DIR,
-            "*.json"
-        )
+    if len(sys.argv) < 2:
+        print("Missing video path")
+        sys.exit(1)
+
+    video_path = sys.argv[1]
+
+    vid = os.path.splitext(
+        os.path.basename(video_path)
+    )[0]
+
+
+    # =========================
+    # Transcript
+    # =========================
+
+    transcript_path = os.path.join(
+        TRANSCRIPT_DIR,
+        f"{vid}.json"
     )
 
-    if len(transcript_files) == 0:
+    transcript_data = load_json(
+        transcript_path
+    )
 
-        print("No transcript files")
+    transcript = transcript_data.get(
+        "transcript",
+        ""
+    )
 
-        return
-
-    results = []
-
-    for transcript_path in transcript_files:
-
-        transcript_data = load_json(
-            transcript_path
-        )
-
-        vid = transcript_data.get(
-            "vid",
-            ""
-        )
-
-        transcript = transcript_data.get(
-            "transcript",
-            ""
-        )
-
-        ocr_path = os.path.join(
-            OCR_DIR,
-            f"{vid}.json"
-        )
-
-        ocr_data = load_json(
-            ocr_path
-        )
-
-        ocr = ocr_data.get(
-            "ocr",
-            ""
-        )
-
-        record = {
-            "vid": vid,
-            "transcript": transcript,
-            "ocr": ocr
-        }
-
-        results.append(record)
 
     # =========================
-    # 只保留最新一筆
+    # VLM
     # =========================
 
-    latest = results[-1]
+    vlm_path = os.path.join(
+        VLM_DIR,
+        f"{vid}.json"
+    )
+
+    vlm_data = load_json(
+        vlm_path
+    )
+
+    description = vlm_data.get(
+        "description",
+        ""
+    )
+
 
     # =========================
-    # 每次覆蓋 all.json
+    # Merge
+    # =========================
+
+    record = {
+        "vid": vid,
+        "transcript": transcript,
+        "description": description
+    }
+
+
+    # =========================
+    # 覆蓋 all.json
     # =========================
 
     with open(
@@ -120,23 +120,23 @@ def main():
     ) as f:
 
         json.dump(
-            latest,
+            record,
             f,
             ensure_ascii=False,
             indent=2
         )
 
+
     print("=" * 50)
-
     print("Data Merge Done")
-
+    print(f"VID: {vid}")
+    print(f"Transcript: {transcript_path}")
+    print(f"VLM: {vlm_path}")
     print(f"Saved: {OUTPUT_FILE}")
-
     print("=" * 50)
 
 
 # =========================
 
 if __name__ == "__main__":
-
     main()
